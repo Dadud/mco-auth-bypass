@@ -1,0 +1,12 @@
+# Build artifacts
+authlogin.dll
+authlogin.dll.exp
+authlogin.dll.lib
+*.o
+*.obj
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
