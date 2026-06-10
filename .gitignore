@@ -1,9 +1,16 @@
 # Build artifacts
 authlogin.dll
+authlogin-fallback.dll
 authlogin.dll.exp
 authlogin.dll.lib
 *.o
 *.obj
+*.so
+*.exe
+
+# Test artifacts
+tests/test_shim
+tests/test_shim.exe
 
 # Editor / OS
 .vscode/

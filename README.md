@@ -1,28 +1,50 @@
 # mco-auth-bypass
 
-Replacement `authlogin.dll` for **Motor City Online** (2001, EA). Returns a
-valid offline ticket for any credentials, so the game launches without
-talking to EA's auth servers.
+Universal client-side auth + NPS shim for **Motor City Online** (2001, EA).
+Drop in, redirect the game to your own server, get past the login screen.
 
-Extracted from [Dadud/OpenMCO](https://github.com/Dadud/OpenMCO), packaged
-as a standalone drop-in for any other MCO-related project.
+v2.0.0 — extracted from [Dadud/OpenMCO](https://github.com/Dadud/OpenMCO)
+and extended with a Winsock detour that works with **any** MCO server project.
 
 ## What you get
 
 | File | Purpose |
 | --- | --- |
-| `authlogin.c` | The DLL source. ~140 lines of C, single file, no deps. |
-| `build.sh` | Cross-compile to `authlogin.dll` from Linux/macOS (needs `mingw-w64`). |
-| `build_authlogin.bat` | Build on Windows (needs MinGW or MSVC). |
-| `install.sh` | Copy a built DLL into a game's install tree. |
+| `authlogin.c` | The shim. ~600 lines, builds with mingw-w64. |
+| `build.sh` | Cross-compile to `authlogin.dll` from Linux/macOS. |
+| `build_authlogin.bat` | Build on Windows. |
+| `install.sh` | Copy built DLL into a game's install dir. |
+| `tests/test_shim.c` + `tests/build_test.sh` | Unit tests for the pure data layer. |
+| `INTEGRATION.md` | **Read this.** Three scenarios (offline, redirect to your server, embed your own ticket). |
 | `LICENSE` | MIT, with the same EA legal notice as OpenMCO. |
 
-The DLL exports the same symbols EA's original `authlogin.dll` does
-(`GetTicketSync[A|W]`, `AuthLogin_Init`, `AuthLogin_Shutdown`,
-`AuthLogin_GetLastError`, `AuthLogin_GetServerName`,
-`AuthLogin_SetServerName`, `AuthLogin_GetVersion`). All of them short-circuit
-to success. The only network-aware function (`GetServerName`) still returns
-`"www.ea.com"` so the game doesn't notice the server is gone.
+## What it does
+
+Two things, both on by default:
+
+1. **Authlib bypass.** Replaces EA's `authlogin.dll`. `GetTicketSync` returns
+   a self-describing `MCO1` ticket for any credentials. The game skips EA's
+   HTTPS auth and proceeds to NPS as if everything were normal.
+2. **NPS redirect.** Detours `ws2_32!WSAConnect` and rewrites the destination
+   IP to `NPS_REDIRECT_HOST` (default `127.0.0.1`). All NPS/MCOTS traffic
+   lands on a server the coder controls. Port stays the same (8226, 7003,
+   43300, etc.).
+
+Optional, opt-in via `-DENABLE_INPROC_FALLBACK`:
+
+3. **In-proc NPS responder.** The DLL binds `127.0.0.1:8226` and answers
+   `NPS_USER_LOGIN` (0x501) with a hardcoded `NPS_USER_VALID` (0x601) so
+   the game reaches character select with no external server. Does **not**
+   speak MCOTS or lobby — those are out of scope for a 25 KB shim.
+
+## What it doesn't do (by design, see INTEGRATION.md)
+
+- No RSA / DES / RC4 / DCL compression. Those belong in your **server**.
+- No `NPS_OK_TO_LOGIN` (0x230) handshake. Your **lobby server** does that.
+- No MCOTS. Your **shard** does that.
+
+The shim's job is to make the client side portable. The server side is
+your project.
 
 ## Build
 
@@ -32,7 +54,8 @@ to success. The only network-aware function (`GetServerName`) still returns
 build_authlogin.bat
 ```
 
-Needs `gcc` in PATH (MinGW) or substitute `cl /LD authlogin.c /Fe:authlogin.dll` for MSVC.
+Needs `gcc` in PATH (MinGW). For the fallback build, edit the `.bat`
+to add `-DENABLE_INPROC_FALLBACK`.
 
 ### Linux / macOS
 
@@ -44,26 +67,51 @@ brew install mingw-w64           # macOS
 
 Output: `authlogin.dll` in the current directory.
 
-## Install
-
-Drop the built DLL into the game's `update` directory (the folder that
-contains `MCity_d.exe` / `MCity.exe`).
-
-### From this repo
+### With the in-proc fallback enabled
 
 ```bash
-./build.sh
+i686-w64-mingw32-gcc -shared -o authlogin.dll authlogin.c -static \
+    -Wl,--subsystem,windows -lws2_32 -DENABLE_INPROC_FALLBACK
+```
+
+## Test
+
+The pure data layer is unit-tested:
+
+```bash
+cd tests
+./build_test.sh   # cross-compiles and runs the test (needs wine on Linux)
+# or
+gcc -o test_shim test_shim.c && ./test_shim   # native build
+```
+
+Expected: `19 passed, 0 failed`.
+
+The detour and the in-proc fallback are not unit-tested. They need a
+live game process to exercise; verify them on a Windows box with the
+actual game.
+
+## Install
+
+```bash
 ./install.sh /path/to/MCO/update
 ```
 
-### Manually
+The DLL ends up in the game's `update` directory alongside
+`MCity_d.exe`. The game loads it before the system `ws2_32`.
 
-```bash
-cp authlogin.dll /path/to/MCO/update/
+## Use it with your server
+
+**Read [INTEGRATION.md](INTEGRATION.md).** Three scenarios, copy-paste
+Python ticket validator, full ticket format spec, honest list of what
+the shim does and doesn't do.
+
+Quick start: edit `NPS_REDIRECT_HOST` in `authlogin.c`, build, install,
+start your server on that host's port 8226.
+
+```c
+#define NPS_REDIRECT_HOST "192.168.1.42"   /* your server */
 ```
-
-The game's loader will pick up `authlogin.dll` from its own directory
-before the system one. No registration, no config, no registry edits.
 
 ## Use in another project
 
@@ -73,7 +121,7 @@ Three common ways to consume this repo from a parent project:
 
 ```bash
 git submodule add https://github.com/Dadud/mco-auth-bypass.git vendor/mco-auth-bypass
-git -C vendor/mco-auth-bypass checkout v1.0.0
+git -C vendor/mco-auth-bypass checkout v2.0.0
 ```
 
 In your build:
@@ -84,14 +132,14 @@ cd vendor/mco-auth-bypass && ./build.sh && cp authlogin.dll ../../dist/
 
 Update later: `git submodule update --remote vendor/mco-auth-bypass`.
 
-### 2. CMake `FetchContent` (no submodule metadata, fully reproducible)
+### 2. CMake `FetchContent`
 
 ```cmake
 include(FetchContent)
 FetchContent_Declare(
   mco-auth-bypass
   GIT_REPOSITORY https://github.com/Dadud/mco-auth-bypass.git
-  GIT_TAG        v1.0.0
+  GIT_TAG        v2.0.0
 )
 FetchContent_MakeAvailable(mco-auth-bypass)
 add_custom_target(authlogin.dll
@@ -102,7 +150,7 @@ add_custom_target(authlogin.dll
 )
 ```
 
-### 3. Plain `curl` (no git linkage, smallest footprint)
+### 3. Plain `curl` (no git linkage)
 
 ```bash
 curl -L https://github.com/Dadud/mco-auth-bypass/archive/refs/heads/main.tar.gz \
@@ -110,9 +158,6 @@ curl -L https://github.com/Dadud/mco-auth-bypass/archive/refs/heads/main.tar.gz 
 (cd vendor/mco-auth-bypass && ./build.sh)
 cp vendor/mco-auth-bypass/authlogin.dll dist/
 ```
-
-Use this if you don't want a permanent connection to this repo in
-`.gitmodules` or `CMakeLists.txt`.
 
 ## License
 
