@@ -1,8 +1,5 @@
 # Build artifacts
 authlogin.dll
-authlogin-fallback.dll
-authlogin-fallback-offline.dll
-authlogin-dev.dll
 authlogin.dll.exp
 authlogin.dll.lib
 *.o
