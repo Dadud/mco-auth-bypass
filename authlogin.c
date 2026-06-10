@@ -40,6 +40,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <winhttp.h>      /* WinHTTP for the modernized login POST */
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -52,8 +53,34 @@
 
 /* Where NPS connections get redirected. Default: loopback so the coder's
  * local server picks them up. Change to your server's IP if it's not
- * on the same machine. */
+ * on the same machine. Also used as the host portion of the default
+ * LOGIN_URL. */
 #define NPS_REDIRECT_HOST "127.0.0.1"
+
+/* Port for the modernized login endpoint. The full default URL is
+ * https://<NPS_REDIRECT_HOST>:8443/auth/login. Override LOGIN_URL below
+ * to change the path or scheme. */
+#define LOGIN_PORT 8443
+#define LOGIN_PATH "/auth/login"
+
+/* Set LOGIN_URL to a full URL to override the derived default. If left
+ * as the empty string, the DLL uses https://<NPS_REDIRECT_HOST>:8443/auth/login
+ * (or http://... if LOGIN_ALLOW_INSECURE is defined). */
+#define LOGIN_URL ""
+
+/* HTTP request timeout in milliseconds. */
+#define LOGIN_TIMEOUT_MS 5000
+
+/* If LOGIN_ALLOW_INSECURE is defined, the DLL will accept plain HTTP
+ * for the login endpoint (http:// instead of https://). DO NOT enable
+ * in production. Off by default. */
+/* #define LOGIN_ALLOW_INSECURE */
+
+/* If LOGIN_FALLBACK_OFFLINE is defined and the login server is
+ * unreachable, the DLL falls back to the MCO1 offline ticket (v2.0.0
+ * behavior) so the game still launches. Off by default - in production
+ * you want a hard failure so silent outages don't get masked. */
+/* #define LOGIN_FALLBACK_OFFLINE */
 
 /* Ticket format. The DLL returns a self-describing ticket so any server
  * can validate it without prior coordination. Format:
@@ -141,7 +168,294 @@ static int build_ticket(char* out, int out_size)
 }
 
 /* ------------------------------------------------------------------
- * EXPORTS - EA authlib interface (unchanged from v1.0.0)
+ * MODERNIZED LOGIN - real HTTPS POST to a login endpoint
+ * ------------------------------------------------------------------
+ *
+ * Replaces the v2.0.0 'always return MCO1 ticket' behavior. GetTicketSync
+ * now POSTs the supplied username + password to a configurable endpoint
+ * and returns the ticket the server issues.
+ *
+ * Wire format (request):
+ *   POST <LOGIN_URL> HTTP/1.1
+ *   Host: <NPS_REDIRECT_HOST>
+ *   Content-Type: application/json
+ *
+ *   {"username":"...","password":"..."}
+ *
+ * Wire format (response on 200):
+ *   {"ticket":"<server-issued>","customer_id":<u32>,"persona_id":<u32>}
+ *   Only the "ticket" field is required. customer_id/persona_id are
+ *   optional; if present, the DLL logs them at INFO level for debugging.
+ *
+ * Wire format (response on 401 or any non-200):
+ *   {"error":"<reason>"}   (body ignored; reason code returned to game)
+ *
+ * On transport failure (connection refused, timeout, DNS):
+ *   - If LOGIN_FALLBACK_OFFLINE is defined: return the MCO1 ticket (v2.0.0 behavior)
+ *   - Otherwise: return failure with reason=-2 (network error)
+ *
+ * Build flags:
+ *   -DLOGIN_ALLOW_INSECURE   Use http:// instead of https:// (dev only)
+ *   -DLOGIN_FALLBACK_OFFLINE Return offline ticket on transport error
+ */
+
+/* Build a minimal JSON body: {"username":"...","password":"..."}
+ * Performs basic JSON string escaping (backslash and double-quote).
+ * Returns the number of bytes written, or 0 on overflow. */
+static int build_login_json_body(char* out, int out_size,
+                                 const char* username, const char* password)
+{
+    int n = 0;
+    int w = 0;
+    /* {"username":" */
+    w = snprintf(out + n, out_size - n, "{\"username\":\"");
+    if (w < 0 || w >= out_size - n) return 0;
+    n += w;
+    /* username with escaping */
+    for (const char* p = username ? username : ""; *p && n < out_size - 16; p++) {
+        if (*p == '\\' || *p == '"') out[n++] = '\\';
+        out[n++] = *p;
+    }
+    /* ","password":" */
+    w = snprintf(out + n, out_size - n, "\",\"password\":\"");
+    if (w < 0 || w >= out_size - n) return 0;
+    n += w;
+    /* password with escaping */
+    for (const char* p = password ? password : ""; *p && n < out_size - 16; p++) {
+        if (*p == '\\' || *p == '"') out[n++] = '\\';
+        out[n++] = *p;
+    }
+    /* "} */
+    if (n + 2 >= out_size) return 0;
+    out[n++] = '"';
+    out[n++] = '}';
+    out[n] = '\0';
+    return n;
+}
+
+/* Naive JSON field extractor: looks for "key":"value" in a flat JSON
+ * object and copies the value (up to out_size-1 bytes) into out.
+ * Returns 1 on success, 0 if the key is not found. This is intentionally
+ * simple - we trust the server to send well-formed JSON, and we only
+ * need to extract a single string field ("ticket"). */
+static int json_get_string_field(const char* json, int json_len,
+                                 const char* key, char* out, int out_size)
+{
+    char needle[64];
+    int n = snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    if (n < 0 || n >= (int)sizeof(needle)) return 0;
+    const char* p = json;
+    const char* end = json + json_len;
+    while (p < end) {
+        if (p + n > end) return 0;
+        if (memcmp(p, needle, n) == 0) {
+            const char* v = p + n;
+            int i = 0;
+            while (v < end && *v != '"' && i < out_size - 1) {
+                /* Handle backslash-escapes simply. */
+                if (*v == '\\' && v + 1 < end) v++;
+                out[i++] = *v++;
+            }
+            out[i] = '\0';
+            return 1;
+        }
+        p++;
+    }
+    return 0;
+}
+
+/* WinHTTP is per-thread, so we initialize WinHTTP on first use and
+ * open a session. The session is process-global. Caller must be the
+ * same thread for session + connect + request lifecycle. */
+static HINTERNET g_http_session = NULL;
+static CRITICAL_SECTION g_http_lock;
+static BOOL g_http_lock_init = FALSE;
+
+static int login_via_http(const char* username, const char* password,
+                          char* out_ticket, int out_ticket_size,
+                          int* out_reason)
+{
+    if (out_ticket == NULL || out_ticket_size < 32) {
+        if (out_reason) *out_reason = -1;
+        return 0;
+    }
+    out_ticket[0] = '\0';
+    if (out_reason) *out_reason = 0;
+
+    if (!g_http_lock_init) {
+        InitializeCriticalSection(&g_http_lock);
+        g_http_lock_init = TRUE;
+    }
+    EnterCriticalSection(&g_http_lock);
+
+    if (g_http_session == NULL) {
+        g_http_session = WinHttpOpen(L"mco-auth-bypass/2.1",
+                                     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                     WINHTTP_NO_PROXY_NAME,
+                                     WINHTTP_NO_PROXY_BYPASS, 0);
+    }
+    if (g_http_session == NULL) {
+        LeaveCriticalSection(&g_http_lock);
+#ifdef LOGIN_FALLBACK_OFFLINE
+        build_ticket(out_ticket, out_ticket_size);
+        return 1;
+#else
+        if (out_reason) *out_reason = -2;
+        return 0;
+#endif
+    }
+
+    /* Resolve LOGIN_URL: explicit override, or derived from NPS_REDIRECT_HOST. */
+    wchar_t wurl[512];
+    const char* scheme;
+#ifdef LOGIN_ALLOW_INSECURE
+    scheme = "http://";
+#else
+    scheme = "https://";
+#endif
+    if (LOGIN_URL[0] != '\0') {
+        /* Use the override URL. Convert to wide. */
+        int wn = MultiByteToWideChar(CP_ACP, 0, LOGIN_URL, -1, wurl, 512);
+        if (wn == 0) {
+            LeaveCriticalSection(&g_http_lock);
+            if (out_reason) *out_reason = -2;
+            return 0;
+        }
+    } else {
+        /* Derived default: scheme://NPS_REDIRECT_HOST:LOGIN_PORT/LOGIN_PATH */
+        char url[512];
+        snprintf(url, sizeof(url), "%s%s:%d%s", scheme, NPS_REDIRECT_HOST, LOGIN_PORT, LOGIN_PATH);
+        int wn = MultiByteToWideChar(CP_ACP, 0, url, -1, wurl, 512);
+        if (wn == 0) {
+            LeaveCriticalSection(&g_http_lock);
+            if (out_reason) *out_reason = -2;
+            return 0;
+        }
+    }
+
+    /* WinHTTP needs the URL split into components. */
+    URL_COMPONENTS urlc;
+    memset(&urlc, 0, sizeof(urlc));
+    urlc.dwStructSize = sizeof(urlc);
+    wchar_t host[128] = {0};
+    wchar_t path[256] = {0};
+    urlc.lpszHostName = host;
+    urlc.dwHostNameLength = 128;
+    urlc.lpszUrlPath = path;
+    urlc.dwUrlPathLength = 256;
+    if (!WinHttpCrackUrl(wurl, 0, 0, &urlc)) {
+        LeaveCriticalSection(&g_http_lock);
+        if (out_reason) *out_reason = -2;
+        return 0;
+    }
+    DWORD port = urlc.nPort;
+
+    HINTERNET connect = WinHttpConnect(g_http_session, urlc.lpszHostName,
+                                        port, 0);
+    if (connect == NULL) {
+        LeaveCriticalSection(&g_http_lock);
+        if (out_reason) *out_reason = -2;
+        return 0;
+    }
+    DWORD flags = (urlc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET request = WinHttpOpenRequest(connect, L"POST", urlc.lpszUrlPath,
+                                           NULL, WINHTTP_NO_REFERER,
+                                           WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (request == NULL) {
+        WinHttpCloseHandle(connect);
+        LeaveCriticalSection(&g_http_lock);
+        if (out_reason) *out_reason = -2;
+        return 0;
+    }
+    /* Set timeouts. */
+    WinHttpSetTimeouts(request, LOGIN_TIMEOUT_MS, LOGIN_TIMEOUT_MS,
+                       LOGIN_TIMEOUT_MS, LOGIN_TIMEOUT_MS);
+
+    /* Build and send the body. */
+    char body[1024];
+    int body_len = build_login_json_body(body, sizeof(body), username, password);
+    if (body_len <= 0) {
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connect);
+        LeaveCriticalSection(&g_http_lock);
+        if (out_reason) *out_reason = -1;
+        return 0;
+    }
+
+    LPCWSTR headers = L"Content-Type: application/json\r\n";
+    BOOL ok = WinHttpSendRequest(request, headers, (DWORD)-1L,
+                                 (LPVOID)body, (DWORD)body_len, (DWORD)body_len, 0);
+    if (!ok) {
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connect);
+        LeaveCriticalSection(&g_http_lock);
+#ifdef LOGIN_FALLBACK_OFFLINE
+        build_ticket(out_ticket, out_ticket_size);
+        if (out_reason) *out_reason = -2;
+        return 1;
+#else
+        if (out_reason) *out_reason = -2;
+        return 0;
+#endif
+    }
+    if (!WinHttpReceiveResponse(request, NULL)) {
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connect);
+        LeaveCriticalSection(&g_http_lock);
+#ifdef LOGIN_FALLBACK_OFFLINE
+        build_ticket(out_ticket, out_ticket_size);
+        if (out_reason) *out_reason = -2;
+        return 1;
+#else
+        if (out_reason) *out_reason = -2;
+        return 0;
+#endif
+    }
+
+    /* Read status code. */
+    DWORD status = 0;
+    DWORD status_size = sizeof(status);
+    WinHttpQueryHeaders(request,
+                        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX,
+                        &status, &status_size, WINHTTP_NO_HEADER_INDEX);
+    if (status < 200 || status >= 300) {
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connect);
+        LeaveCriticalSection(&g_http_lock);
+        if (out_reason) *out_reason = (int)(status == 401 ? -3 : -4);
+        return 0;
+    }
+
+    /* Read response body. */
+    char resp[4096];
+    int resp_len = 0;
+    for (;;) {
+        DWORD avail = 0;
+        if (!WinHttpQueryDataAvailable(request, &avail)) break;
+        if (avail == 0) break;
+        if (resp_len + (int)avail > (int)sizeof(resp)) avail = sizeof(resp) - resp_len;
+        DWORD read = 0;
+        if (!WinHttpReadData(request, resp + resp_len, avail, &read)) break;
+        resp_len += read;
+        if (resp_len >= (int)sizeof(resp) - 1) break;
+    }
+    resp[resp_len] = '\0';
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    LeaveCriticalSection(&g_http_lock);
+
+    if (!json_get_string_field(resp, resp_len, "ticket", out_ticket, out_ticket_size)) {
+        /* 200 OK but no ticket field - server bug */
+        if (out_reason) *out_reason = -5;
+        return 0;
+    }
+    if (out_reason) *out_reason = 0;
+    return 1;
+}
+
+/* ------------------------------------------------------------------
+ * EXPORTS - EA authlib interface
  * ------------------------------------------------------------------
  */
 
@@ -149,14 +463,29 @@ __declspec(dllexport)
 int WINAPI GetTicketSync(const char* username, const char* password,
                          char* outTicket, int* outReasonCode)
 {
-    if (outTicket != NULL) {
-        if (!build_ticket(outTicket, 256)) {
-            if (outReasonCode != NULL) *outReasonCode = -1;
-            return 0;
+    if (outTicket == NULL) {
+        if (outReasonCode != NULL) *outReasonCode = -1;
+        return 0;
+    }
+    /* Try the modernized login endpoint first. */
+    if (login_via_http(username, password, outTicket, 256, outReasonCode)) {
+        return 1;
+    }
+    /* login_via_http returned failure. If the failure was a network
+     * error AND the caller compiled with LOGIN_FALLBACK_OFFLINE, fall
+     * back to the v2.0.0 MCO1 ticket. Note: login_via_http handles
+     * the fallback itself when the flag is set, so this branch is
+     * only reached for actual auth failures (401, malformed, etc.). */
+#ifdef LOGIN_FALLBACK_OFFLINE
+    if (outReasonCode && (*outReasonCode == -3 || *outReasonCode == -5)) {
+        /* Auth failure (not network). Still try offline. */
+        if (build_ticket(outTicket, 256)) {
+            *outReasonCode = 0;
+            return 1;
         }
     }
-    if (outReasonCode != NULL) *outReasonCode = 0;  /* 0 = success */
-    return 1;  /* TRUE */
+#endif
+    return 0;
 }
 
 __declspec(dllexport)

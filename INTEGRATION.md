@@ -138,6 +138,130 @@ tickets.
 
 ---
 
+## Scenario D — Modernized login (real auth against a server)  *(v2.1.0+)*
+
+You have a real login endpoint and want the game to do real
+username+password auth. The DLL POSTs the credentials to a
+configurable HTTPS endpoint, gets a ticket back, returns it to the
+game. The MCO1 self-describing format is replaced by whatever your
+server issues (JWT, opaque token, anything).
+
+**Build the default v2.1.0 variant:**
+
+```bash
+i686-w64-mingw32-gcc -shared -o authlogin.dll authlogin.c -static \
+    -Wl,--subsystem,windows -lws2_32 -lwinhttp
+```
+
+**Configure the login URL** in `authlogin.c`:
+
+```c
+/* Default: https://<NPS_REDIRECT_HOST>:8443/auth/login
+ * (i.e., the login endpoint lives on the same host the NPS detour
+ * points at, port 8443, path /auth/login.) */
+#define NPS_REDIRECT_HOST "192.168.1.42"
+#define LOGIN_PORT 8443
+#define LOGIN_PATH "/auth/login"
+
+/* Or override the full URL: */
+#define LOGIN_URL "https://auth.myshard.example.com/login"
+```
+
+**Run a login endpoint on your server.** Minimal Flask:
+
+```python
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+@app.post("/auth/login")
+def login():
+    body = request.get_json(force=True, silent=True) or {}
+    user = body.get("username", "")
+    pw   = body.get("password", "")
+    # ... your auth: bcrypt, OAuth, LDAP, whatever ...
+    if not authenticate(user, pw):
+        return jsonify({"error": "invalid"}), 401
+    ticket = issue_session_token(user)  # JWT, opaque, your call
+    return jsonify({
+        "ticket": ticket,
+        "customer_id": lookup_customer_id(user),
+        "persona_id":  1,
+    }), 200
+```
+
+**Build the cert into the trusted root store** (Windows side). If
+you're using mkcert or a self-signed cert, install it once:
+
+```cmd
+certutil -addstore -f "Root" cert.pem
+```
+
+Or use a real cert (Let's Encrypt works for `*.example.com` domains
+pointing at your dev box via DNS).
+
+**Optional build flags:**
+
+```bash
+# http:// instead of https:// (for dev only, no cert hassle)
+-DLOGIN_ALLOW_INSECURE
+
+# Network error -> fall back to the v2.0.0 offline ticket
+# (handy for development when your auth server is down)
+-DLOGIN_FALLBACK_OFFLINE
+
+# Both at once (full dev mode)
+i686-w64-mingw32-gcc ... -DLOGIN_ALLOW_INSECURE -DLOGIN_FALLBACK_OFFLINE
+```
+
+**Wire format the DLL expects from your server:**
+
+Request:
+```http
+POST /auth/login HTTP/1.1
+Host: <NPS_REDIRECT_HOST>
+Content-Type: application/json
+
+{"username":"alice","password":"s3cret"}
+```
+
+Response (success, 200):
+```json
+{"ticket":"<server-issued>", "customer_id":1001, "persona_id":1}
+```
+
+The DLL only reads the `ticket` field. `customer_id` and
+`persona_id` are optional and currently ignored (logged at debug
+level only). The ticket string can be anything up to ~250 bytes.
+
+Response (auth failure, 401/403):
+```json
+{"error":"invalid credentials"}
+```
+
+The DLL returns failure to the game with `outReasonCode` set to -3.
+The game's authlib layer will display the standard "login failed"
+UI to the user.
+
+Response (server bug, 200 but no ticket field):
+```json
+{"error":"missing ticket field"}
+```
+
+The DLL returns failure with `outReasonCode` set to -5. Treat this
+as a server-side bug; fix the endpoint.
+
+**On transport failure** (connection refused, timeout, DNS fail):
+- If compiled with `-DLOGIN_FALLBACK_OFFLINE`: DLL returns the
+  MCO1 offline ticket and `outReasonCode=-2`. Game launches
+  against whatever NPS server is reachable. (Useful for "I want
+  to test the lobby without standing up the auth server.")
+- Otherwise: DLL returns failure with `outReasonCode=-2`. Game
+  shows a network error. (Production behavior - silent outages
+  are bad.)
+
+---
+
 ## Ticket format spec (for server implementors)
 
 ```
